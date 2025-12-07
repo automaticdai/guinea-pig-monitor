@@ -523,29 +523,17 @@ class StatisticsAggregator:
         
         return report
     
-    def save_stats(self, current_time):
+    def save_stats(self, current_time, hay_zone_has_motion=False):
         """Save statistics to JSON file"""
         try:
-            # Finalize current behaviors before saving
-            temp_stats = {}
-            for track_id in set(self.stats.keys()) | set(self.current_behavior.keys()):
-                if track_id in self.current_behavior and self.current_behavior[track_id]:
-                    if self.behavior_start_time[track_id] >= 0:
-                        current_behavior = self.current_behavior[track_id]
-                        current_duration = current_time - self.behavior_start_time[track_id]
-                        if current_duration > 0:
-                            temp_stats[track_id] = self.stats[track_id].copy()
-                            temp_stats[track_id][current_behavior] = temp_stats[track_id].get(current_behavior, 0) + current_duration
-                        else:
-                            temp_stats[track_id] = self.stats[track_id].copy()
-                    else:
-                        temp_stats[track_id] = self.stats[track_id].copy()
-                else:
-                    temp_stats[track_id] = self.stats[track_id].copy()
+            # Use get_stats_with_lost_track_sleep to include lost track sleeping time
+            # This ensures sleeping time from lost tracks is included in saved stats
+            all_track_ids = set(self.stats.keys()) | set(self.current_behavior.keys())
             
-            # Note: We don't need to track total_accumulated_time separately
-            # because total_time is calculated as sum of all behaviors
-            # The stats themselves already contain accumulated time from all sessions
+            # Get final stats including lost track sleep/eat time for all tracks
+            final_stats = {}
+            for track_id in all_track_ids:
+                final_stats[track_id] = self.get_stats_with_lost_track_sleep(track_id, current_time, hay_zone_has_motion)
             
             # Get final stats for all tracks
             data = {
@@ -555,11 +543,10 @@ class StatisticsAggregator:
                 'tracks': {}
             }
             
-            all_track_ids = set(self.stats.keys()) | set(self.current_behavior.keys())
             for track_id in all_track_ids:
-                # Save accumulated stats including finalized current behavior
+                # Save accumulated stats including lost track sleep/eat time
                 track_data = {
-                    'stats': dict(temp_stats.get(track_id, self.stats[track_id])),
+                    'stats': dict(final_stats[track_id]),
                     'track_start_time': 0.0,  # Always reset to 0 for next session
                     'last_seen_time': 0.0,  # Reset for next session
                     'current_behavior': '',  # Session-specific, don't save
@@ -663,6 +650,7 @@ class GuineaPigMonitor:
         
         # Timing debug
         self.timing_enabled = True
+        self.show_timing_reports = False  # Default: timing reports off
         self.timing_stats = {
             'frame_read': [],
             'yolo_inference': [],
@@ -905,8 +893,8 @@ class GuineaPigMonitor:
             self.timing_stats['total'].append(total_time)
             self.timing_frame_count += 1
             
-            # Print timing report periodically
-            if self.timing_frame_count % self.timing_report_interval == 0:
+            # Print timing report periodically (only if enabled)
+            if self.timing_frame_count % self.timing_report_interval == 0 and self.show_timing_reports:
                 self.print_timing_report()
         
         self.frame_id += 1
@@ -1248,6 +1236,7 @@ class GuineaPigMonitor:
         print("  - Press 's': Save ROIs to zones.json")
         print("  - Press 'h': Toggle statistics HUD")
         print("  - Press 'c': Clear statistics")
+        print("  - Press 'd': Toggle timing breakdown reports")
         print("  - Press 'q': Quit")
         
         last_save_time = time.time()
@@ -1284,7 +1273,16 @@ class GuineaPigMonitor:
                 current_time = time.time()
                 if current_time - last_save_time > save_interval:
                     current_elapsed = time.time() - self.start_time
-                    self.stats_aggregator.save_stats(current_elapsed)
+                    # Check hay zone motion for lost tracks
+                    hay_zone_has_motion = False
+                    if hasattr(self, 'flow_analyzer') and self.roi_manager.zones['hay'] is not None:
+                        hay_roi = self.roi_manager.zones['hay']
+                        x_coords = hay_roi[:, 0]
+                        y_coords = hay_roi[:, 1]
+                        hay_bbox = [x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()]
+                        hay_flow = self.flow_analyzer.get_flow_in_region(hay_bbox)
+                        hay_zone_has_motion = hay_flow > 0.15
+                    self.stats_aggregator.save_stats(current_elapsed, hay_zone_has_motion)
                     last_save_time = current_time
                 
                 # Handle keyboard input
@@ -1298,6 +1296,12 @@ class GuineaPigMonitor:
                 elif key == ord('h'):
                     self.show_stats = not self.show_stats
                     print(f"Statistics HUD: {'ON' if self.show_stats else 'OFF'}")
+                elif key == ord('c'):
+                    self.stats_aggregator.clear_stats()
+                    print("Statistics cleared")
+                elif key == ord('d'):
+                    self.show_timing_reports = not self.show_timing_reports
+                    print(f"Timing breakdown reports: {'ON' if self.show_timing_reports else 'OFF'}")
         
         except KeyboardInterrupt:
             print("\nInterrupted by user")
@@ -1306,7 +1310,16 @@ class GuineaPigMonitor:
             # Save statistics before exit
             current_time = time.time() - self.start_time
             print("\nSaving statistics...")
-            self.stats_aggregator.save_stats(current_time)
+            # Check hay zone motion for lost tracks (if we have a recent frame)
+            hay_zone_has_motion = False
+            if hasattr(self, 'flow_analyzer') and self.roi_manager.zones['hay'] is not None:
+                hay_roi = self.roi_manager.zones['hay']
+                x_coords = hay_roi[:, 0]
+                y_coords = hay_roi[:, 1]
+                hay_bbox = [x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max()]
+                hay_flow = self.flow_analyzer.get_flow_in_region(hay_bbox)
+                hay_zone_has_motion = hay_flow > 0.15
+            self.stats_aggregator.save_stats(current_time, hay_zone_has_motion)
             
             # Stop frame reader thread
             self.stop_frame_reader = True

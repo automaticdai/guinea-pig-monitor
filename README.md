@@ -1,6 +1,14 @@
-# Guinea Pig Behavior Monitoring System
+# Guinea Pig Behavior Monitoring (GPM) System
 
-A real-time guinea pig behavior monitoring system that uses YOLO object detection, ByteTrack multi-object tracking, optical flow analysis, and rule-based behavior classification.
+The GPM, or real-time guinea pig behavior monitoring system, uses YOLO object detection, ByteTrack multi-object tracking, optical flow analysis, and rule-based behavior classification.
+
+This project is designed for my guinea pig, Souffle:
+
+![](pics/souffle.jpg)
+
+A screenshot of GPM:
+
+![](pics/screenshot.png)
 
 ## Features
 
@@ -65,6 +73,26 @@ python main.py
 2. After defining 4 ROIs, the next ROI will cycle back to hay
 3. Press 's' to save your ROI configuration
 4. ROIs are automatically loaded from `data/zones.json` on startup
+
+
+## Train Your Own Model:
+
+Make sure the Ultralytics is installed: `pip install ultralytics`
+
+Then:
+
+`yolo detect train model=yolo11m.pt data=dataset/data.yaml epochs=100 imgsz=640`
+
+Other optional models (choose based on the capacity of your GPU):
+
+| Model                                                                                | size  <br>(pixels) | mAPval  <br>50-95 | Speed  <br>CPU ONNX  <br>(ms) | Speed  <br>T4 TensorRT10  <br>(ms) | params  <br>(M) | FLOPs  <br>(B) |
+| ------------------------------------------------------------------------------------ | ------------------ | ----------------- | ----------------------------- | ---------------------------------- | --------------- | -------------- |
+| [YOLO11n](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt) | 640                | 39.5              | 56.1 ± 0.8                    | 1.5 ± 0.0                          | 2.6             | 6.5            |
+| [YOLO11s](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt) | 640                | 47.0              | 90.0 ± 1.2                    | 2.5 ± 0.0                          | 9.4             | 21.5           |
+| [YOLO11m](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11m.pt) | 640                | 51.5              | 183.2 ± 2.0                   | 4.7 ± 0.1                          | 20.1            | 68.0           |
+| [YOLO11l](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11l.pt) | 640                | 53.4              | 238.6 ± 1.4                   | 6.2 ± 0.1                          | 25.3            | 86.9           |
+| [YOLO11x](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11x.pt) | 640                | 54.7              | 462.8 ± 6.7                   | 11.3 ± 0.2                         | 56.9            | 194.9          |
+
 
 ## Behavior Classification Logic
 
