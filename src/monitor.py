@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import time
 import threading
+import os
+import warnings
 from queue import Queue, Empty
 from ultralytics import YOLO
 from bytetrack import ByteTracker
@@ -13,6 +15,29 @@ from .roi_manager import ROIManager
 from .optical_flow import OpticalFlowAnalyzer
 from .behavior_classifier import BehaviorClassifier
 from .statistics import StatisticsAggregator
+
+# Suppress OpenCV FFmpeg timeout warnings
+# These warnings occur when RTSP streams have temporary network issues
+# but don't affect functionality
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+
+# Try to set OpenCV log level (method/constants may vary by version)
+try:
+    if hasattr(cv2, 'setLogLevel'):
+        # Try different possible constant names
+        if hasattr(cv2, 'LOG_LEVEL_ERROR'):
+            cv2.setLogLevel(cv2.LOG_LEVEL_ERROR)
+        elif hasattr(cv2, 'LOG_LEVEL_SILENT'):
+            cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
+        elif hasattr(cv2, 'utils') and hasattr(cv2.utils, 'logging'):
+            # OpenCV 4.5+ uses utils.logging
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except (AttributeError, TypeError):
+    # If log level setting fails, warnings will still be suppressed by environment variable
+    pass
+
+# Also suppress Python warnings from OpenCV
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='cv2')
 
 
 class GuineaPigMonitor:
@@ -46,6 +71,8 @@ class GuineaPigMonitor:
         self.frame_queue = Queue(maxsize=2)  # Small buffer to prevent lag
         self.frame_reader_thread = None
         self.stop_frame_reader = False
+        self.is_reconnecting = False  # Track reconnection state to suppress timeout messages
+        self.last_frame_time = time.time()  # Track when we last received a frame
         
         # FPS tracking
         self.fps = 0.0
@@ -82,31 +109,108 @@ class GuineaPigMonitor:
     def _frame_reader_worker(self):
         """Worker thread that continuously reads frames from the stream"""
         consecutive_failures = 0
+        max_consecutive_failures = 30  # Allow more failures before backing off
+        reconnect_attempts = 0
+        max_reconnect_attempts = 5
+        
         while not self.stop_frame_reader:
             if self.cap is None or not self.cap.isOpened():
-                time.sleep(0.01)
+                # Try to reconnect if we have an RTSP URL
+                self.is_reconnecting = True  # Set reconnecting flag
+                if self.rtsp_url and reconnect_attempts < max_reconnect_attempts:
+                    time.sleep(1.0)  # Wait before reconnecting
+                    print(f"Attempting to reconnect to RTSP stream (attempt {reconnect_attempts + 1}/{max_reconnect_attempts})...")
+                    if self._open_video_capture(self.rtsp_url):
+                        print("Reconnected successfully!")
+                        reconnect_attempts = 0
+                        consecutive_failures = 0
+                        self.is_reconnecting = False  # Clear reconnecting flag
+                    else:
+                        reconnect_attempts += 1
+                elif self.rtsp_url:
+                    # Reached max reconnect attempts, wait longer before retrying
+                    if reconnect_attempts >= max_reconnect_attempts:
+                        print(f"Max reconnection attempts reached. Waiting 10 seconds before retrying...")
+                        time.sleep(10.0)
+                        reconnect_attempts = 0  # Reset to allow another round of attempts
+                else:
+                    time.sleep(0.1)
                 continue
             
             read_start = time.time()
             
             # Try grab() + retrieve() which can be faster than read()
             # First grab the frame metadata (non-blocking)
-            grabbed = self.cap.grab()
+            try:
+                grabbed = self.cap.grab()
+            except Exception as e:
+                # Handle any exceptions during grab
+                consecutive_failures += 1
+                if consecutive_failures > max_consecutive_failures:
+                    print(f"Frame grab error: {e}. Stream may be disconnected.")
+                    if self.cap:
+                        self.cap.release()
+                    self.cap = None
+                    self.is_reconnecting = True  # Set reconnecting flag
+                    reconnect_attempts = 0  # Reset attempts for new reconnection cycle
+                    consecutive_failures = 0  # Reset failure count
+                time.sleep(0.1)
+                continue
             
             if not grabbed:
                 consecutive_failures += 1
-                if consecutive_failures > 10:
+                if consecutive_failures > max_consecutive_failures:
+                    # Always close and attempt reconnect after persistent failures
+                    # (isOpened() can return True even when stream is broken)
+                    print("Stream appears disconnected (grab failed repeatedly). Attempting to reconnect...")
+                    if self.cap:
+                        self.cap.release()
+                    self.cap = None
+                    self.is_reconnecting = True  # Set reconnecting flag
+                    reconnect_attempts = 0  # Reset attempts for new reconnection cycle
+                    consecutive_failures = 0  # Reset failure count
                     time.sleep(0.1)
+                else:
+                    time.sleep(0.01)
                 continue
             
             consecutive_failures = 0
+            reconnect_attempts = 0  # Reset on successful read
+            self.is_reconnecting = False  # Clear reconnecting flag on successful grab
             
             # Now retrieve the actual frame
-            ret, frame = self.cap.retrieve()
+            try:
+                ret, frame = self.cap.retrieve()
+            except Exception as e:
+                # Handle any exceptions during retrieve
+                consecutive_failures += 1
+                if consecutive_failures > max_consecutive_failures:
+                    print(f"Frame retrieve error: {e}. Stream may be disconnected.")
+                    if self.cap:
+                        self.cap.release()
+                    self.cap = None
+                    self.is_reconnecting = True  # Set reconnecting flag
+                    reconnect_attempts = 0  # Reset attempts for new reconnection cycle
+                    consecutive_failures = 0  # Reset failure count
+                time.sleep(0.1)
+                continue
+            
             read_time = time.time() - read_start
             
             if not ret or frame is None:
-                time.sleep(0.01)
+                consecutive_failures += 1
+                if consecutive_failures > max_consecutive_failures:
+                    # Also close and reconnect if retrieve returns None repeatedly
+                    print("Stream appears disconnected (retrieve returned None repeatedly). Attempting to reconnect...")
+                    if self.cap:
+                        self.cap.release()
+                    self.cap = None
+                    self.is_reconnecting = True  # Set reconnecting flag
+                    reconnect_attempts = 0  # Reset attempts for new reconnection cycle
+                    consecutive_failures = 0  # Reset failure count
+                    time.sleep(0.1)
+                else:
+                    time.sleep(0.01)
                 continue
             
             # Store timing if enabled
@@ -116,11 +220,13 @@ class GuineaPigMonitor:
             # Put frame in queue (drop old frames if queue is full to prevent lag)
             try:
                 self.frame_queue.put_nowait((frame, read_start))
+                self.last_frame_time = time.time()  # Update last frame time
             except:
                 # Queue full, drop oldest frame to always use latest
                 try:
                     self.frame_queue.get_nowait()
                     self.frame_queue.put_nowait((frame, read_start))
+                    self.last_frame_time = time.time()  # Update last frame time
                 except:
                     pass
     
@@ -613,26 +719,117 @@ class GuineaPigMonitor:
                                  bar_width, bar_height, line_height, padding, 
                                  font, font_scale, thickness)
 
+    def _open_video_capture(self, url):
+        """Open video capture with RTSP-specific optimizations"""
+        if url and url.startswith('rtsp://'):
+            # Try multiple RTSP URL formats and transport methods
+            # Some cameras require different URL formats or transport protocols
+            rtsp_variants = []
+            
+            # Extract base URL (without existing parameters)
+            base_url = url.split('?')[0]
+            
+            # Try different transport methods and URL formats
+            # 1. Original URL (no transport specified - let OpenCV decide)
+            rtsp_variants.append(url)
+            
+            # 2. TCP transport (more reliable, but slower)
+            if '?' in url:
+                rtsp_variants.append(f"{url}&rtsp_transport=tcp")
+            else:
+                rtsp_variants.append(f"{url}?rtsp_transport=tcp")
+            
+            # 3. UDP transport (faster, but less reliable)
+            if '?' in url:
+                rtsp_variants.append(f"{url}&rtsp_transport=udp")
+            else:
+                rtsp_variants.append(f"{url}?rtsp_transport=udp")
+            
+            # 4. Try with different path formats (common variations)
+            # Some cameras use /h264, /main, /sub, /1, /2, etc.
+            path_parts = base_url.split('/')
+            if len(path_parts) > 3:
+                base_path = '/'.join(path_parts[:-1])  # Everything except last part
+                last_part = path_parts[-1]
+                
+                # Try common alternative paths
+                common_paths = ['/h264', '/main', '/sub', '/1', '/2', '/stream', '/live']
+                for alt_path in common_paths:
+                    if alt_path not in base_url:
+                        rtsp_variants.append(f"{base_path}{alt_path}?rtsp_transport=tcp")
+            
+            # Try each variant until one works
+            last_error = None
+            for rtsp_url in rtsp_variants:
+                try:
+                    # Try to use FFmpeg backend if available
+                    if hasattr(cv2, 'CAP_FFMPEG'):
+                        self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                    else:
+                        self.cap = cv2.VideoCapture(rtsp_url)
+                    
+                    # Give it a moment to connect
+                    time.sleep(0.5)
+                    
+                    # Check if opened and try to read a property to verify connection
+                    if self.cap.isOpened():
+                        # Try to read a frame property to verify the stream is actually accessible
+                        width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                        if width > 0:
+                            # Success! Configure the stream
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            self.cap.set(cv2.CAP_PROP_FPS, 30)
+                            if rtsp_url != url:
+                                print(f"Connected using alternative URL format: {rtsp_url}")
+                            return True
+                        else:
+                            # Opened but can't read properties - might be wrong URL
+                            self.cap.release()
+                            self.cap = None
+                except Exception as e:
+                    last_error = e
+                    if self.cap:
+                        self.cap.release()
+                        self.cap = None
+                    continue
+            
+            # If we get here, none of the variants worked
+            print(f"\nError: Could not connect to RTSP stream")
+            print(f"Tried {len(rtsp_variants)} different URL/transport combinations")
+            if last_error:
+                print(f"Last error: {last_error}")
+            print(f"\nTroubleshooting tips:")
+            print(f"  1. Verify the RTSP URL is correct")
+            print(f"  2. Check if the camera is accessible: ping {url.split('@')[1].split(':')[0] if '@' in url else 'camera_ip'}")
+            print(f"  3. Try accessing the stream with VLC or ffplay to verify it works")
+            print(f"  4. Check camera documentation for correct RTSP path")
+            print(f"  5. Some cameras require different paths like /h264, /main, /sub, etc.")
+            return False
+        else:
+            # For non-RTSP sources (webcam, file, etc.)
+            self.cap = cv2.VideoCapture(url if url else 0)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return self.cap.isOpened()
+    
     def run(self):
         """Main loop"""
         # Open video source
         if self.rtsp_url:
-            self.cap = cv2.VideoCapture(self.rtsp_url)
+            if not self._open_video_capture(self.rtsp_url):
+                print("Error: Could not open RTSP stream")
+                return
         else:
             # Try to open default camera or ask for RTSP URL
             print("No RTSP URL provided. Please provide RTSP URL or use default camera.")
             rtsp_url = input("Enter RTSP URL (or press Enter for default camera): ").strip()
             if rtsp_url:
-                self.cap = cv2.VideoCapture(rtsp_url)
+                if not self._open_video_capture(rtsp_url):
+                    print("Error: Could not open video source")
+                    return
             else:
-                self.cap = cv2.VideoCapture(0)
-        
-        if not self.cap.isOpened():
-            print("Error: Could not open video source")
-            return
-        
-        # Set buffer size to 1 to minimize latency and frame accumulation
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if not self._open_video_capture(None):
+                    print("Error: Could not open default camera")
+                    return
         
         # Start threaded frame reader
         self.stop_frame_reader = False
@@ -653,12 +850,22 @@ class GuineaPigMonitor:
         save_interval = 60.0  # Auto-save every 60 seconds
         
         try:
+            last_timeout_message = 0.0
+            timeout_message_interval = 5.0  # Only print timeout message every 5 seconds
+            
             while True:
                 # Get frame from queue (non-blocking with timeout)
                 try:
                     frame, read_start = self.frame_queue.get(timeout=1.0)
                 except Empty:
-                    print("Timeout waiting for frame")
+                    # Only print timeout message if not reconnecting and enough time has passed
+                    current_time = time.time()
+                    if not self.is_reconnecting and (current_time - last_timeout_message) >= timeout_message_interval:
+                        # Check if we actually haven't received frames for a while
+                        time_since_last_frame = current_time - self.last_frame_time
+                        if time_since_last_frame >= timeout_message_interval:
+                            print(f"Timeout waiting for frame (no frames for {time_since_last_frame:.1f}s)")
+                            last_timeout_message = current_time
                     continue
                 
                 # Process frame (pass frame_start for accurate total timing)

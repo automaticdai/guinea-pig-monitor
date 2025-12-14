@@ -59,13 +59,24 @@ pip install -r requirements.txt
 
 3. **Install YOLO model:**
    - Ensure the YOLO model is at `model/yolov11.pt`
-   - You can download pre-trained models from [Ultralytics](https://github.com/ultralytics/assets)
+   - You can use my pre-trained model, or train your own model (see below) 
 
 4. **(Optional) GPU acceleration for optical flow:**
-```bash
-pip install opencv-contrib-python
-```
-   Note: This requires CUDA-enabled OpenCV. The system will automatically fall back to CPU if GPU is not available.
+   
+   **For RTX 5080/5090 (Blackwell) or other modern GPUs:**
+   ```bash
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+   ```
+   The system will automatically use PyTorch GPU acceleration (works with CUDA 12.8+).
+   
+   **For older GPUs (if OpenCV CUDA is available):**
+   ```bash
+   pip install opencv-contrib-python
+   ```
+   Note: Standard opencv-contrib-python from PyPI doesn't include CUDA support. 
+   You need OpenCV built from source with CUDA, or use PyTorch GPU acceleration instead.
+   
+   The system will automatically fall back to CPU if GPU is not available.
 
 ## Usage
 
